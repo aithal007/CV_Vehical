@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# Jupyter / tooling
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local-only files
+instructions.pdf
+image.png
+
+# Large datasets / generated artifacts (keep code repo small)
+dataset/
+dataset_3k/
+complete data/
+Car-Bike-Dataset/
+Vehicle Type Image Dataset (Version 2) VTID2/
+PennFudanPed/
+images.cv_o35cpmt8no96e06lkqt81x/
+pred2/
+pred3/
+preded/
+bus/
+car2/
+truck/
+truck2/
+nature/
+Vyronasdbmin/
+
+# Training outputs
+output/
+runs/
+checkpoints/
+
+# Keep model weights tracked via Git LFS (do NOT ignore *.pth here)

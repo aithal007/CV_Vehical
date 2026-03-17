@@ -16,7 +16,7 @@ import torch.nn.utils.prune as prune
 from torch.utils.data import DataLoader
 import copy
 
-from vehicle_classifier import LightweightVehicleCNN, SqueezeNetClassifier, CLASS_IDX
+from vehicle_classifier import LightweightVehicleCNN, CLASS_IDX
 
 
 def count_parameters(model):
@@ -47,7 +47,7 @@ def estimate_model_size(model, dtype=torch.float32):
 
 def apply_dynamic_quantization(model):
     """
-    Apply dynamic quantization to linear and conv layers.
+    Apply dynamic quantization to Linear layers.
     This is the simplest form of quantization - no calibration needed.
     """
     model_cpu = model.cpu()
@@ -55,7 +55,7 @@ def apply_dynamic_quantization(model):
     
     quantized_model = torch.quantization.quantize_dynamic(
         model_cpu,
-        {nn.Linear, nn.Conv2d},
+        {nn.Linear},
         dtype=torch.qint8
     )
     
@@ -299,16 +299,6 @@ def main():
     
     # Compare actual sizes
     compare_model_sizes(model)
-    
-    # Also check SqueezeNet
-    print("\n" + "="*60)
-    print("Checking SqueezeNet as alternative...")
-    print("="*60)
-    
-    squeezenet = SqueezeNetClassifier(num_classes=5, pretrained=False)
-    total_params, _ = count_parameters(squeezenet)
-    print(f"SqueezeNet parameters: {total_params:,}")
-    compare_model_sizes(squeezenet)
 
 
 if __name__ == "__main__":

@@ -47,4 +47,10 @@ output/
 runs/
 checkpoints/
 
+# Robustness test outputs
+robustness_tests/
+
+# ImageNet winter21 download/extract output
+imagenet_winter21_vehicle/
+
 # Keep model weights tracked via Git LFS (do NOT ignore *.pth here)

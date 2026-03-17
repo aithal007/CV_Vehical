@@ -1,531 +1,440 @@
 """
-Advanced Training Script for Vehicle Classification CNN
-========================================================
-Key Improvements over v1:
-  1. WeightedRandomSampler  -> auto-balances classes (Bus gets 4.5x more sampling)
-  2. Focal Loss              -> focuses on hard/misclassified examples
-  3. Label Smoothing (0.1)   -> prevents overconfident predictions
-  4. Mixup Augmentation      -> creates virtual training examples between classes
-  5. OneCycleLR Scheduler    -> super-convergence for faster, better training
-  6. EMA (Exponential Moving Average) -> smoother final model
-  7. Gradient Clipping       -> stabilizes training
-  8. Stronger Augmentation   -> GaussianBlur, AffineTransforms, heavier ColorJitter
-  9. Class-aware evaluation  -> confusion matrix at end
+Vehicle Classification — Simple Training Script
+================================================
+- No warmup, no mixup, no fancy LR schedules
+- Just: pretrained MobileNetV2 → train → prune(55%) + FP16 → < 5 MB
+- Uses CosineAnnealingLR (set-and-forget, stable)
 
-Usage:
-    python train.py --data_dir dataset/train --val_dir dataset/val --epochs 60 --pretrained --quantize
+Command:
+    python train.py --data_dir new_added --epochs 50 --pretrained --quantize
 """
 
 import os
 import copy
-import argparse
 import random
+import argparse
+from collections import Counter, defaultdict
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageFile
 import numpy as np
 from tqdm import tqdm
 import json
-from collections import Counter
 
-# Import our model
-from vehicle_classifier import LightweightVehicleCNN, CLASS_IDX
+from vehicle_classifier import LightweightVehicleCNN, CLASS_IDX, save_compressed
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+CLASS_TO_IDX = {"Bus": 0, "Truck": 1, "Car": 2, "Bike": 3, "None": 4}
+VALID_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".jfif"}
 
 
-# -----------------------------------------------
-#  Focal Loss  -  down-weights easy examples
-# -----------------------------------------------
+# ══════════════════════════════════════════════════════════════
+#  LOSS
+# ══════════════════════════════════════════════════════════════
 class FocalLoss(nn.Module):
-    """
-    Focal Loss (Lin et al., 2017) focuses on hard examples.
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
-    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.1, num_classes=5):
+    def __init__(self, gamma: float = 1.5, label_smoothing: float = 0.05, num_classes: int = 5):
         super().__init__()
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        self.num_classes = num_classes
-        if alpha is not None:
-            self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
-        else:
-            self.alpha = None
+        self.gamma = float(gamma)
+        self.label_smoothing = float(label_smoothing)
+        self.num_classes = int(num_classes)
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         log_probs = F.log_softmax(logits, dim=1)
-        probs = torch.exp(log_probs)
-
-        # Focal weight
+        probs = log_probs.exp()
         pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        focal_weight = (1 - pt) ** self.gamma
+        focal_w = (1.0 - pt) ** self.gamma
 
         if self.label_smoothing > 0:
-            smooth_targets = torch.zeros_like(logits)
-            smooth_targets.fill_(self.label_smoothing / (self.num_classes - 1))
-            smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
-            loss = -(smooth_targets * log_probs).sum(dim=1)
+            smooth = torch.full_like(logits, self.label_smoothing / (self.num_classes - 1))
+            smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            loss = -(smooth * log_probs).sum(dim=1)
         else:
-            loss = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            loss = F.nll_loss(log_probs, targets, reduction="none")
 
-        loss = focal_weight * loss
-
-        if self.alpha is not None:
-            alpha_t = self.alpha.to(logits.device)[targets]
-            loss = alpha_t * loss
-
-        return loss.mean()
+        return (focal_w * loss).mean()
 
 
-# -----------------------------------------------
-#  Mixup  -  virtual training examples
-# -----------------------------------------------
-def mixup_data(x, y, alpha=0.2):
-    """Returns mixed inputs, pairs of targets, and lambda."""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-    lam = max(lam, 1 - lam)
-    index = torch.randperm(x.size(0), device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    return mixed_x, y, y[index], lam
-
-
-def mixup_criterion(criterion_fn, pred, y_a, y_b, lam):
-    return lam * criterion_fn(pred, y_a) + (1 - lam) * criterion_fn(pred, y_b)
-
-
-# -----------------------------------------------
-#  EMA  -  exponential moving average of weights
-# -----------------------------------------------
+# ══════════════════════════════════════════════════════════════
+#  EMA
+# ══════════════════════════════════════════════════════════════
 class EMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.original = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+    def __init__(self, model: nn.Module, decay: float = 0.998):
+        self.decay = float(decay)
+        self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+        self.backup = {}
 
-    def update(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+    def update(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = self.decay * self.shadow[n] + (1.0 - self.decay) * p.data
 
-    def apply_shadow(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.original[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+    def apply(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n])
 
-    def restore(self, model):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.original[name])
+    def restore(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.backup[n])
 
 
-# -----------------------------------------------
-#  Dataset
-# -----------------------------------------------
+# ══════════════════════════════════════════════════════════════
+#  DATASET
+# ══════════════════════════════════════════════════════════════
 class VehicleDataset(Dataset):
-    CLASS_TO_IDX = {"Bus": 0, "Truck": 1, "Car": 2, "Bike": 3, "None": 4}
-    VALID_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.jfif'}
-
-    def __init__(self, data_dir, transform=None, extra_class_dirs=None):
-        self.data_dir = data_dir
+    def __init__(self, samples: List[Tuple[str, int]], transform=None, bad_image_retries: int = 3):
+        self.samples = list(samples)
         self.transform = transform
-        self.extra_class_dirs = extra_class_dirs or {}
-        self.samples = []
-        self.targets = []
-        self._load()
-
-    def _collect_images_recursive(self, folder):
-        files = []
-        for root, _, filenames in os.walk(folder):
-            for fname in filenames:
-                if os.path.splitext(fname)[1].lower() in self.VALID_EXT:
-                    files.append(os.path.join(root, fname))
-        return files
-
-    def _load(self):
-        seen = set()
-
-        for class_name, class_idx in self.CLASS_TO_IDX.items():
-            class_dir = os.path.join(self.data_dir, class_name)
-            if not os.path.isdir(class_dir):
-                print(f"  Warning: {class_dir} not found")
-                continue
-            for fname in os.listdir(class_dir):
-                if os.path.splitext(fname)[1].lower() in self.VALID_EXT:
-                    path = os.path.join(class_dir, fname)
-                    norm = os.path.normcase(os.path.abspath(path))
-                    if norm in seen:
-                        continue
-                    seen.add(norm)
-                    self.samples.append((path, class_idx))
-                    self.targets.append(class_idx)
-
-        # Optionally inject additional folders into existing classes (e.g., pedestrian data -> None)
-        for class_name, extra_dirs in self.extra_class_dirs.items():
-            if class_name not in self.CLASS_TO_IDX:
-                print(f"  Warning: Unknown class '{class_name}' in extra_class_dirs, skipping")
-                continue
-
-            class_idx = self.CLASS_TO_IDX[class_name]
-            for extra_dir in extra_dirs:
-                if not os.path.isdir(extra_dir):
-                    print(f"  Warning: extra dir not found: {extra_dir}")
-                    continue
-
-                added = 0
-                for path in self._collect_images_recursive(extra_dir):
-                    norm = os.path.normcase(os.path.abspath(path))
-                    if norm in seen:
-                        continue
-                    seen.add(norm)
-                    self.samples.append((path, class_idx))
-                    self.targets.append(class_idx)
-                    added += 1
-
-                print(f"  Added {added} extra images to class '{class_name}' from: {extra_dir}")
-
-        print(f"  Loaded {len(self.samples)} images from {self.data_dir}")
+        self.targets = [s[1] for s in self.samples]
+        self.bad_image_retries = max(0, int(bad_image_retries))
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        image = Image.open(path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+    def __getitem__(self, i: int):
+        last_label = 0
+        for _ in range(self.bad_image_retries + 1):
+            path, label = self.samples[i]
+            last_label = label
+            try:
+                with Image.open(path) as im:
+                    img = im.convert("RGB")
+                    img.load()
+                if self.transform:
+                    img = self.transform(img)
+                return img, label
+            except Exception:
+                i = random.randrange(len(self.samples))
+
+        return torch.zeros(3, 160, 160), int(last_label)
 
 
-# -----------------------------------------------
-#  Augmentation Transforms
-# -----------------------------------------------
+# ══════════════════════════════════════════════════════════════
+#  TRANSFORMS
+# ══════════════════════════════════════════════════════════════
 class GaussianBlur:
-    def __init__(self, radius_range=(0.1, 2.0), p=0.3):
-        self.radius_range = radius_range
-        self.p = p
+    def __init__(self, p: float = 0.2):
+        self.p = float(p)
 
-    def __call__(self, img):
+    def __call__(self, img: Image.Image):
         if random.random() < self.p:
-            radius = random.uniform(*self.radius_range)
-            return img.filter(ImageFilter.GaussianBlur(radius=radius))
+            return img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 1.5)))
         return img
 
 
-def get_train_transforms(img_size=160):
-    """Heavy augmentation for robustness to illumination, occlusion, viewpoint."""
+def get_train_transforms(img_size: int = 160):
     return transforms.Compose([
-        transforms.Resize((img_size + 32, img_size + 32)),
-        transforms.RandomResizedCrop(img_size, scale=(0.6, 1.0), ratio=(0.8, 1.2)),
+        transforms.Resize((img_size + 20, img_size + 20)),
+        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(20),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10),
-        transforms.RandomPerspective(distortion_scale=0.25, p=0.3),
-
-        # Photometric augmentation
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.15),
-        transforms.RandomGrayscale(p=0.15),
-        GaussianBlur(p=0.3),
-        transforms.RandomAutocontrast(p=0.2),
-        transforms.RandomEqualize(p=0.2),
-
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.RandomGrayscale(p=0.1),
+        GaussianBlur(p=0.2),
         transforms.ToTensor(),
-
-        # Occlusion simulation
-        transforms.RandomErasing(p=0.5, scale=(0.02, 0.25), ratio=(0.3, 3.3), value='random'),
-
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), value="random"),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
-def get_val_transforms(img_size=160):
-    """Clean validation transforms."""
+def get_val_transforms(img_size: int = 160):
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
-# -----------------------------------------------
-#  Weighted Sampler for Class Balance
-# -----------------------------------------------
-def make_weighted_sampler(dataset):
-    """Oversamples minority classes so each class has equal probability."""
-    targets = dataset.targets
-    class_counts = Counter(targets)
-    total = len(targets)
-    num_classes = len(class_counts)
+# ══════════════════════════════════════════════════════════════
+#  SAMPLER
+# ══════════════════════════════════════════════════════════════
+def make_sampler(dataset: VehicleDataset) -> WeightedRandomSampler:
+    targets = list(dataset.targets)
+    counts = Counter(targets)
+    n, nc = len(targets), len(counts)
+    w = {c: n / (nc * cnt) for c, cnt in counts.items()}
 
-    print("\n  Class distribution:")
-    for idx in sorted(class_counts.keys()):
-        name = CLASS_IDX[idx]
-        count = class_counts[idx]
-        print(f"    {name:>5s}: {count:5d} images ({100.0 * count / total:5.1f}%)")
+    print("\n  Class distribution + weights:")
+    for i in sorted(counts):
+        print(f"    {CLASS_IDX[i]:>5s}: {counts[i]:5d} imgs → {w[i]:.3f}x")
 
-    class_weights = {cls: total / (num_classes * count) for cls, count in class_counts.items()}
-    sample_weights = [class_weights[t] for t in targets]
-
-    print("\n  Effective sampling weights:")
-    for idx in sorted(class_weights.keys()):
-        print(f"    {CLASS_IDX[idx]:>5s}: {class_weights[idx]:.3f}x")
-
-    return WeightedRandomSampler(weights=sample_weights, num_samples=len(targets), replacement=True)
+    return WeightedRandomSampler([w[t] for t in targets], num_samples=n, replacement=True)
 
 
-# -----------------------------------------------
-#  Training + Validation
-# -----------------------------------------------
-def train_one_epoch(model, loader, criterion, optimizer, device,
-                    epoch, use_mixup=True, mixup_alpha=0.2, clip_grad=1.0):
+# ══════════════════════════════════════════════════════════════
+#  TRAIN / VAL
+# ══════════════════════════════════════════════════════════════
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch: int, ema: EMA):
     model.train()
-    running_loss = 0.0
+    loss_sum = 0.0
     correct = 0
     total = 0
 
-    pbar = tqdm(loader, desc=f"  Train Ep {epoch}", leave=False)
-    for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
+    pbar = tqdm(loader, desc=f"  Train Ep {epoch:3d}", leave=False)
+    for imgs, labels in pbar:
+        imgs, labels = imgs.to(device), labels.to(device)
+        out = model(imgs)
+        loss = criterion(out, labels)
 
-        do_mixup = use_mixup and epoch > 3 and random.random() < 0.5
-        if do_mixup:
-            images, y_a, y_b, lam = mixup_data(images, labels, mixup_alpha)
-            outputs = model(images)
-            loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-            _, preds = outputs.max(1)
-            correct += (lam * preds.eq(y_a).sum().item() + (1 - lam) * preds.eq(y_b).sum().item())
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            _, preds = outputs.max(1)
-            correct += preds.eq(labels).sum().item()
-
+        preds = out.argmax(1)
+        correct += preds.eq(labels).sum().item()
         total += labels.size(0)
 
         optimizer.zero_grad()
         loss.backward()
-        if clip_grad > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        nn.utils.clip_grad_norm_(model.parameters(), 2.0)
         optimizer.step()
+        ema.update(model)
 
-        running_loss += loss.item()
-        pbar.set_postfix({
-            'loss': f'{running_loss / (pbar.n + 1):.4f}',
-            'acc': f'{100. * correct / total:.1f}%'
-        })
+        loss_sum += float(loss.item())
+        pbar.set_postfix(loss=f"{loss_sum/(pbar.n+1):.4f}", acc=f"{100*correct/total:.1f}%")
 
-    return running_loss / len(loader), 100. * correct / total
+    return loss_sum / max(1, len(loader)), 100.0 * correct / max(1, total)
 
 
 def validate(model, loader, device):
     model.eval()
     correct = 0
     total = 0
-    class_correct = {i: 0 for i in range(5)}
-    class_total = {i: 0 for i in range(5)}
-    confusion = torch.zeros(5, 5, dtype=torch.long)
+    cc = [0] * 5
+    ct = [0] * 5
+    conf = torch.zeros(5, 5, dtype=torch.long)
 
     with torch.no_grad():
-        for images, labels in tqdm(loader, desc="  Validating", leave=False):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, preds = outputs.max(1)
+        for imgs, labels in tqdm(loader, desc="  Validating ", leave=False):
+            imgs, labels = imgs.to(device), labels.to(device)
+            preds = model(imgs).argmax(1)
+
             total += labels.size(0)
             correct += preds.eq(labels).sum().item()
+            for t, p in zip(labels.tolist(), preds.tolist()):
+                ct[t] += 1
+                if t == p:
+                    cc[t] += 1
+                conf[t][p] += 1
 
-            for t, p in zip(labels, preds):
-                ti, pi = t.item(), p.item()
-                class_total[ti] += 1
-                if ti == pi:
-                    class_correct[ti] += 1
-                confusion[ti][pi] += 1
+    acc = 100.0 * correct / max(1, total)
 
-    overall_acc = 100. * correct / total
-
-    print(f"\n  Val Accuracy: {overall_acc:.2f}%")
+    print(f"\n  Val Accuracy: {acc:.2f}%")
     print("  Per-class:")
-    for idx in range(5):
-        name = CLASS_IDX[idx]
-        if class_total[idx] > 0:
-            acc = 100. * class_correct[idx] / class_total[idx]
-            print(f"    {name:>5s}: {acc:6.2f}%  ({class_correct[idx]}/{class_total[idx]})")
+    for i in range(5):
+        if ct[i]:
+            print(f"    {CLASS_IDX[i]:>5s}: {100*cc[i]/ct[i]:.1f}%  ({cc[i]}/{ct[i]})")
 
     print("\n  Confusion Matrix (row=actual, col=predicted):")
     print("        " + "  ".join(f"{CLASS_IDX[i]:>5s}" for i in range(5)))
     for i in range(5):
-        print(f"  {CLASS_IDX[i]:>5s}  " + "  ".join(f"{confusion[i][j]:5d}" for j in range(5)))
+        print(f"  {CLASS_IDX[i]:>5s}  " + "  ".join(f"{conf[i][j]:5d}" for j in range(5)))
 
-    return overall_acc
-
-
-# -----------------------------------------------
-#  Quantize + Save
-# -----------------------------------------------
-def quantize_and_save(model, path):
-    m = copy.deepcopy(model).cpu().eval()
-    q = torch.quantization.quantize_dynamic(m, {nn.Linear, nn.Conv2d}, dtype=torch.qint8)
-    torch.save(q.state_dict(), path)
-    return os.path.getsize(path) / (1024 * 1024)
+    return acc
 
 
-def save_float(model, path):
-    torch.save(model.cpu().state_dict(), path)
-    return os.path.getsize(path) / (1024 * 1024)
-
-
-# -----------------------------------------------
-#  Main
-# -----------------------------------------------
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(description='Vehicle Classifier Training v2')
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--val_dir', type=str, default=None)
-    parser.add_argument('--epochs', type=int, default=60)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--img_size', type=int, default=160)
-    parser.add_argument('--pretrained', action='store_true')
-    parser.add_argument('--quantize', action='store_true')
-    parser.add_argument('--no_mixup', action='store_true')
-    parser.add_argument('--mixup_alpha', type=float, default=0.2)
-    parser.add_argument('--label_smoothing', type=float, default=0.1)
-    parser.add_argument('--clip_grad', type=float, default=1.0)
-    parser.add_argument('--save_path', type=str, default='student_model.pth')
-    parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--use_pred_pedestrian', action='store_true',
-                        help='Add pred2/pred3/preded (train/valid) as extra None-class images')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", required=True)
+    parser.add_argument("--val_dir", default=None)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--img_size", type=int, default=160)
+    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Prune(55%) + FP16 to stay under 5 MB",
+    )
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--save_path", default="student_model.pth")
+    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--bad_image_retries", type=int, default=3)
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_pin = device.type == "cuda"
+
     print(f"\n{'='*55}")
-    print(f"  Vehicle Classifier Training v2")
-    print(f"  Device: {device}")
+    print("  Vehicle Classifier — Simple Training")
+    print(f"  Device     : {device}")
+    print(f"  Pretrained : {args.pretrained}")
     print(f"{'='*55}")
 
-    # Transforms
+    # ── load all samples ────────────────────────────────────
+    print("\nScanning dataset...")
+    all_samples: List[Tuple[str, int]] = []
+    for cls, idx in CLASS_TO_IDX.items():
+        cls_dir = os.path.join(args.data_dir, cls)
+        found: List[Tuple[str, int]] = []
+        if os.path.isdir(cls_dir):
+            for root, _, files in os.walk(cls_dir):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in VALID_EXT:
+                        found.append((os.path.join(root, f), idx))
+        all_samples += found
+        print(f"  {cls:>5s}: {len(found):5d}  {'✅' if found else '❌ NOT FOUND'}")
+    print(f"  Total: {len(all_samples)}")
+
+    # ── stratified split ────────────────────────────────────
+    if args.val_dir:
+        train_samples = all_samples
+        val_samples: List[Tuple[str, int]] = []
+        for cls, idx in CLASS_TO_IDX.items():
+            cls_dir = os.path.join(args.val_dir, cls)
+            if os.path.isdir(cls_dir):
+                for root, _, files in os.walk(cls_dir):
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in VALID_EXT:
+                            val_samples.append((os.path.join(root, f), idx))
+    else:
+        by_class = defaultdict(list)
+        for s in all_samples:
+            by_class[s[1]].append(s)
+        train_samples, val_samples = [], []
+        for _, slist in by_class.items():
+            random.shuffle(slist)
+            n_val = max(1, int(len(slist) * args.val_split))
+            val_samples += slist[:n_val]
+            train_samples += slist[n_val:]
+
+    print(f"\n  Train: {len(train_samples)}  |  Val: {len(val_samples)}")
+
     train_tf = get_train_transforms(args.img_size)
     val_tf = get_val_transforms(args.img_size)
 
-    # Datasets
-    print("\nLoading datasets...")
-    train_extra_dirs = {}
-    val_extra_dirs = {}
+    train_ds = VehicleDataset(train_samples, transform=train_tf, bad_image_retries=args.bad_image_retries)
+    val_ds = VehicleDataset(val_samples, transform=val_tf, bad_image_retries=args.bad_image_retries)
 
-    if args.use_pred_pedestrian:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        train_none_dirs = [
-            os.path.join(base_dir, 'pred2', 'train'),
-            os.path.join(base_dir, 'pred3', 'train'),
-            os.path.join(base_dir, 'preded', 'train'),
-        ]
-        val_none_dirs = [
-            os.path.join(base_dir, 'pred2', 'valid'),
-            os.path.join(base_dir, 'pred3', 'valid'),
-            os.path.join(base_dir, 'preded', 'valid'),
-        ]
-        train_extra_dirs['None'] = train_none_dirs
-        val_extra_dirs['None'] = val_none_dirs
+    sampler = make_sampler(train_ds)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=use_pin,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=use_pin,
+    )
 
-    train_ds = VehicleDataset(args.data_dir, transform=train_tf, extra_class_dirs=train_extra_dirs)
-    if args.val_dir:
-        val_ds = VehicleDataset(args.val_dir, transform=val_tf, extra_class_dirs=val_extra_dirs)
-    else:
-        from torch.utils.data import random_split
-        n_val = int(0.2 * len(train_ds))
-        train_ds, val_ds = random_split(train_ds, [len(train_ds) - n_val, n_val])
-
-    # Weighted sampler
-    print("\nBuilding weighted sampler for class balance...")
-    sampler = make_weighted_sampler(train_ds)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              sampler=sampler, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                            shuffle=False, num_workers=args.num_workers,
-                            pin_memory=True)
-
-    # Model
+    # ── model ───────────────────────────────────────────────
     print("\nCreating model...")
-    model = LightweightVehicleCNN(num_classes=5, pretrained=args.pretrained)
-    model = model.to(device)
-    total_p = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {total_p:,}")
+    model = LightweightVehicleCNN(
+        num_classes=5,
+        pretrained=args.pretrained,
+    ).to(device)
+    print(f"  Parameters : {sum(p.numel() for p in model.parameters()):,}")
 
-    # Simple CE with label smoothing — class balancing is handled by WeightedRandomSampler
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    print(f"  Loss: CrossEntropyLoss (label_smoothing={args.label_smoothing})")
+    criterion = FocalLoss(gamma=1.5, label_smoothing=0.05)
+    ema = EMA(model, decay=0.998)
 
-    # Optimizer + Scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # Differential LR: backbone lower than head
+    backbone_p = [p for n, p in model.named_parameters() if "backbone.classifier" not in n]
+    head_p = [p for n, p in model.named_parameters() if "backbone.classifier" in n]
+    optimizer = optim.AdamW(
+        [
+            {"params": backbone_p, "lr": args.lr * 0.1},
+            {"params": head_p, "lr": args.lr},
+        ],
+        weight_decay=1e-4,
+    )
 
-    # Training
-    best_val_acc = 0.0
-    patience = 15
-    patience_ctr = 0
-    history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-3
+    )
+
+    print(f"  Optimiser  : AdamW | backbone_lr={args.lr*0.1:.5f} | head_lr={args.lr:.5f}")
+    print(f"  Scheduler  : CosineAnnealingLR T_max={args.epochs}")
+
+    # ── training loop ───────────────────────────────────────
+    best_acc = 0.0
+    no_improve = 0
+    history = {"train_loss": [], "train_acc": [], "val_acc": [], "lr": []}
 
     print(f"\n{'='*55}")
-    print(f"  Epochs: {args.epochs} | Mixup: {'ON' if not args.no_mixup else 'OFF'}")
-    print(f"  Loss: CE + label_smoothing={args.label_smoothing}")
-    print(f"  LR: {args.lr} | Scheduler: CosineAnnealing | Grad clip={args.clip_grad}")
+    print(f"  Epochs={args.epochs} | Batch={args.batch_size} | LR={args.lr}")
     print(f"{'='*55}\n")
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device,
-            epoch, use_mixup=not args.no_mixup, mixup_alpha=args.mixup_alpha,
-            clip_grad=args.clip_grad
-        )
-
-        # Validate with actual model weights
-        val_acc = validate(model, val_loader, device)
+    for ep in range(1, args.epochs + 1):
+        tl, ta = train_one_epoch(model, train_loader, criterion, optimizer, device, ep, ema)
         scheduler.step()
 
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_acc'].append(val_acc)
+        ema.apply(model)
+        va = validate(model, val_loader, device)
+        ema.restore(model)
 
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"  Ep {epoch:3d}/{args.epochs} | Loss: {train_loss:.4f} | "
-              f"Train: {train_acc:.1f}% | Val: {val_acc:.2f}% | LR: {current_lr:.6f}")
+        history["train_loss"].append(tl)
+        history["train_acc"].append(ta)
+        history["val_acc"].append(va)
+        history["lr"].append(float(optimizer.param_groups[1]["lr"]))
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            patience_ctr = 0
-            if args.quantize:
-                size_mb = quantize_and_save(model, args.save_path)
-            else:
-                size_mb = save_float(model, args.save_path)
-                model.to(device)
-            ok = "OK" if size_mb < 5 else "OVER 5MB!"
-            print(f"  >>> New best! {val_acc:.2f}% | {size_mb:.2f} MB [{ok}]")
+        current_lr = optimizer.param_groups[1]["lr"]
+        print(
+            f"  Ep {ep:3d}/{args.epochs} | loss={tl:.4f} | "
+            f"train={ta:.1f}% | val={va:.2f}% | lr={current_lr:.2e}"
+        )
+
+        if va > best_acc:
+            best_acc = va
+            no_improve = 0
+            ema.apply(model)
+            try:
+                if args.quantize:
+                    mb = save_compressed(
+                        model,
+                        args.save_path,
+                    )
+                else:
+                    payload = {
+                        "arch": "mobilenet_v3_small",
+                        "quantized": False,
+                        "model_state_dict": copy.deepcopy(model).cpu().state_dict(),
+                    }
+                    torch.save(payload, args.save_path)
+                    mb = os.path.getsize(args.save_path) / 1024 ** 2
+            finally:
+                ema.restore(model)
+
+            tag = "✅ OK" if mb < 5 else "❌ OVER 5MB"
+            print(f"  ★ New best {va:.2f}% | {mb:.2f} MB [{tag}] → {args.save_path}")
         else:
-            patience_ctr += 1
-            if patience_ctr >= patience:
-                print(f"\n  Early stopping (no improvement for {patience} epochs)")
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(f"\n  Early stopping — no improvement for {args.patience} epochs.")
                 break
 
     print(f"\n{'='*55}")
-    print(f"  Done! Best accuracy: {best_val_acc:.2f}%")
+    print(f"  Done! Best val accuracy : {best_acc:.2f}%")
     if os.path.exists(args.save_path):
-        sz = os.path.getsize(args.save_path) / (1024 * 1024)
-        print(f"  Model: {sz:.2f} MB {'(under 5MB)' if sz < 5 else '(OVER 5MB!)'}")
+        mb = os.path.getsize(args.save_path) / 1024 ** 2
+        print(f"  Model size             : {mb:.2f} MB {'✅' if mb < 5 else '❌ OVER 5MB'}")
     print(f"{'='*55}")
 
-    with open(args.save_path.replace('.pth', '_history.json'), 'w') as f:
+    hist_path = args.save_path.replace(".pth", "_history.json")
+    with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    print(f"  History → {hist_path}")
 
 
 if __name__ == "__main__":

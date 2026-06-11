@@ -69,27 +69,18 @@ MobileNetV3-Small uses **depthwise separable convolutions** and **squeeze-and-ex
 ```
 CV_Vehical/
 │
-├── vehicle_classifier.py          # Inference API — VehicleClassifier class
-├── train.py                       # Full training pipeline with augmentation & quantization
-├── predict.py                     # CLI tool for single-image or batch prediction
-├── test_model.py                  # Comprehensive model evaluation & robustness testing
-├── compress_model.py              # Post-training compression (quantization, pruning, export)
+├── vehicle_classifier.py        # Inference API — VehicleClassifier class
+├── train.py                     # Full training pipeline with augmentation & quantization
+├── predict.py                   # CLI tool for single-image or batch prediction
+├── test_model.py                # Comprehensive model evaluation & robustness testing
+├── compress_model.py            # Post-training compression (quantization, pruning, export)
 │
-├── student_model.pth              # Trained & quantized model weights (~3.95 MB)
-├── student_model_v1_backup.pth    # Backup of earlier model version (~3.81 MB)
-├── student_model_history.json     # Training loss & accuracy history (10 epochs)
+├── student_model.pth            # Trained & quantized model weights (~3.95 MB)
+├── student_model_history.json   # Training loss & accuracy history (10 epochs)
 │
-├── add_new_data.py                # Download & integrate new images from web sources
-├── build_balanced_3k_dataset.py   # Build a balanced 3 000-image subset
-├── check_dataset.py               # Quick dataset class-distribution checker
-├── copy_pedestrian_data.py        # Import pedestrian images into the "None" class
-├── organize_complete_data.py      # Merge & deduplicate images from multiple sources
-├── organize_dataset.py            # Full dataset pipeline — download, split, & balance
-│
-├── README.dataset.txt             # Pedestrian dataset attribution (Roboflow, CC BY 4.0)
-├── .gitignore                     # Ignores datasets, outputs, caches, IDE files
-├── .gitattributes                 # Git LFS tracking for .pth files
-└── README.md                      # This file
+├── .gitignore                   # Ignores datasets, outputs, caches, IDE files
+├── .gitattributes               # Git LFS tracking for .pth files
+└── README.md                    # This file
 ```
 
 ### File Roles at a Glance
@@ -101,12 +92,6 @@ CV_Vehical/
 | `predict.py` | **Prediction CLI.** Run predictions on a single image or an entire directory, with optional top-k confidence display and annotated output saving. |
 | `test_model.py` | **Evaluation suite.** Generates a classification report, confusion matrix, per-class metrics, and robustness tests (brightness, contrast, noise, blur, occlusion). |
 | `compress_model.py` | **Compression toolkit.** Applies dynamic/static quantization, structured & unstructured pruning, ONNX export, and reports size & accuracy impact. |
-| `add_new_data.py` | Downloads additional training images from Unsplash and web searches, validates them, and organises by class. |
-| `build_balanced_3k_dataset.py` | Samples a balanced 600-per-class subset from the full dataset. |
-| `organize_dataset.py` | End-to-end dataset builder — downloads from multiple sources, deduplicates, balances, and creates train/val splits. |
-| `organize_complete_data.py` | Merges images from heterogeneous source directories with hash-based deduplication. |
-| `copy_pedestrian_data.py` | Copies pedestrian images (from PennFudanPed or Roboflow) into the `None` class for negative samples. |
-| `check_dataset.py` | Prints per-class image counts for a dataset directory. |
 
 ---
 
@@ -220,14 +205,7 @@ data/
     └── ...
 ```
 
-**Automated tools included:**
-
-| Script | What it does |
-|--------|-------------|
-| `organize_dataset.py` | Downloads from multiple web sources, deduplicates, balances to 600/class, creates train/val split |
-| `build_balanced_3k_dataset.py` | Samples a balanced 3 000-image subset from an existing dataset |
-| `add_new_data.py` | Augments the dataset with images from Unsplash and web searches |
-| `copy_pedestrian_data.py` | Adds pedestrian images as negative ("None" class) samples |
+Place your images in the class folders above, then pass the path to `train.py` with `--data_dir`.
 
 ---
 
